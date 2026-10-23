@@ -22,3 +22,5 @@ Thumbs.db
 .vscode/
 playwright-report/
 test-results/
+
+screen_recording.mp4
