@@ -1,0 +1,132 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Deny all by default (NFR-SEC-001)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isUser(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    function isFamilyMember(familyId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/families/$(familyId)/members/$(request.auth.uid));
+    }
+
+    function getMemberData(familyId) {
+      return get(/databases/$(database)/documents/families/$(familyId)/members/$(request.auth.uid)).data;
+    }
+
+    function hasFamilyRole(familyId, allowedRoles) {
+      return isFamilyMember(familyId) &&
+        (getMemberData(familyId).role in allowedRoles);
+    }
+
+    // User profiles (FR-PROF-001, FR-PROF-002)
+    match /users/{uid} {
+      allow read: if isUser(uid);
+      allow create, update: if isUser(uid) &&
+        request.resource.data.keys().hasOnly(['displayName', 'timeZone', 'activeFamilyId', 'notificationPrefs', 'email', 'createdAt', 'updatedAt']);
+      allow delete: if false; // Deletion handled server-side per FR-AUTH-006
+
+      // Notifications (FR-NOTIF-001)
+      match /notifications/{notificationId} {
+        allow read: if isUser(uid);
+        // Only allow updating the 'read' status by the user
+        allow update: if isUser(uid) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']);
+        allow create, delete: if false; // Created server-side
+      }
+
+      // Assistant conversation history (FR-AI-010, FR-SET-003)
+      match /conversations/{conversationId} {
+        allow read: if isUser(uid);
+        allow create, update, delete: if isUser(uid);
+      }
+
+      // Consent and privacy preferences (FR-SET-001, FR-SET-003)
+      match /consent/{docId} {
+        allow read, write: if isUser(uid);
+      }
+    }
+
+    // Families (FR-FAM-001 - FR-FAM-008)
+    match /families/{familyId} {
+      allow read: if isFamilyMember(familyId);
+      // Only Owner and Admin can update family metadata (name)
+      allow update: if hasFamilyRole(familyId, ['owner', 'admin']);
+      allow create, delete: if false; // Atomic creation and cascade deletion handled server-side
+
+      // Family Members
+      match /members/{memberUid} {
+        allow read: if isFamilyMember(familyId);
+        // Role changes and member removal handled server-side or by owner/admin
+        allow write: if false;
+      }
+
+      // Tasks (FR-TASK-001 - FR-TASK-008)
+      match /tasks/{taskId} {
+        allow read: if isFamilyMember(familyId);
+        
+        // Members, Admins, and Owners can create tasks
+        allow create: if hasFamilyRole(familyId, ['owner', 'admin', 'member']) &&
+          request.resource.data.title is string &&
+          request.resource.data.title.size() >= 1 &&
+          request.resource.data.title.size() <= 120;
+
+        // Members can edit own or assigned tasks; Admins/Owners can edit all
+        allow update: if isFamilyMember(familyId) && (
+          hasFamilyRole(familyId, ['owner', 'admin']) ||
+          (hasFamilyRole(familyId, ['member']) && (
+            resource.data.createdBy == request.auth.uid ||
+            resource.data.assigneeUid == request.auth.uid
+          )) ||
+          // Viewers can only transition status of tasks assigned to them
+          (hasFamilyRole(familyId, ['viewer']) &&
+            resource.data.assigneeUid == request.auth.uid &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'completedAt', 'completedBy']))
+        );
+
+        allow delete: if hasFamilyRole(familyId, ['owner', 'admin']);
+
+        // Task History (FR-TASK-007)
+        match /history/{historyId} {
+          allow read: if isFamilyMember(familyId);
+          // Append-only history write
+          allow create: if isFamilyMember(familyId) &&
+            request.resource.data.actorUid == request.auth.uid;
+          allow update, delete: if false;
+        }
+      }
+
+      // Calendar Events (FR-CAL-001 - FR-CAL-005)
+      match /events/{eventId} {
+        allow read: if isFamilyMember(familyId);
+        // Members, Admins, and Owners can manage calendar events
+        allow create: if hasFamilyRole(familyId, ['owner', 'admin', 'member']) &&
+          request.resource.data.title is string &&
+          request.resource.data.startAt is timestamp &&
+          request.resource.data.endAt is timestamp &&
+          request.resource.data.endAt >= request.resource.data.startAt;
+
+        allow update: if hasFamilyRole(familyId, ['owner', 'admin', 'member']);
+        allow delete: if hasFamilyRole(familyId, ['owner', 'admin']);
+      }
+
+      // Invitations (FR-FAM-002)
+      match /invitations/{inviteId} {
+        // Invitations are only readable by Owners and Admins; redemption is privileged server-side
+        allow read: if hasFamilyRole(familyId, ['owner', 'admin']);
+        allow write: if false;
+      }
+    }
+  }
+}
